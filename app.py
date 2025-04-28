@@ -2,103 +2,142 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import uuid
 import os
-import time
-from datetime import datetime
+import fitz  # PyMuPDF for PDF reading
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import openai
 
+# ===== CONFIGURATION =====
+PDF_FILE = 'SBI.pdf'  # your PDF
+EMBED_MODEL = 'all-MiniLM-L6-v2'
+openai.api_key = os.getenv('OPENAI_API_KEY')  # Set your OpenAI API Key in environment
+
+# ===== SETUP =====
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
-# In-memory store for chat sessions and history
-# For production, consider using a database like PostgreSQL or MongoDB
+# In-memory session storage
 chat_sessions = {}
+
+# Load embedder
+embedder = SentenceTransformer(EMBED_MODEL)
+
+# FAISS index setup
+embedding_dimension = 384  # Dimension of 'all-MiniLM-L6-v2' model
+index = faiss.IndexFlatL2(embedding_dimension)
+
+# Document chunks and corresponding texts
+doc_chunks = []  # List of text chunks
+
+
+def load_and_split_pdf(pdf_path, chunk_size=500):
+    """Load the PDF and split it into chunks"""
+    doc = fitz.open(pdf_path)
+    texts = []
+    for page in doc:
+        text = page.get_text()
+        # Split into small chunks (by sentence/words approx)
+        words = text.split()
+        for i in range(0, len(words), chunk_size):
+            chunk = ' '.join(words[i:i+chunk_size])
+            texts.append(chunk)
+    return texts
+
+
+def create_vector_store(texts):
+    """Create embeddings and build FAISS index"""
+    embeddings = embedder.encode(texts)
+    index.add(np.array(embeddings).astype('float32'))
+    return embeddings
+
+
+def retrieve_relevant_chunks(query, top_k=3):
+    """Retrieve top_k relevant chunks"""
+    query_embedding = embedder.encode([query]).astype('float32')
+    distances, indices = index.search(query_embedding, top_k)
+    retrieved_texts = [doc_chunks[idx] for idx in indices[0] if idx < len(doc_chunks)]
+    return retrieved_texts
+
+
+def generate_answer(context, query):
+    """Generate an answer using OpenAI"""
+    prompt = f"""You are an assistant specialized in SBI's fraud detection system.
+Use the following context from the official document to answer the user's question.
+
+Context:
+{context}
+
+Question: {query}
+
+Answer:"""
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=500
+    )
+    return response['choices'][0]['message']['content'].strip()
+
+
+# ===== Load documents on startup =====
+print("Loading and indexing the document...")
+doc_chunks = load_and_split_pdf(PDF_FILE)
+create_vector_store(doc_chunks)
+print(f"Loaded {len(doc_chunks)} chunks.")
+
+
+# ===== ROUTES =====
 
 @app.route('/')
 def index():
-    return jsonify({"status": "online", "message": "SBI Fraud Detection Chatbot API is running"})
+    return jsonify({"status": "online", "message": "SBI Fraud Detection RAG API running"})
 
 @app.route('/chat/start', methods=['POST'])
 def start_chat():
-    """Initialize a new chat session and return session ID"""
     session_id = str(uuid.uuid4())
-    
-    # Initialize session with timestamp
     chat_sessions[session_id] = {
-        "created_at": datetime.now().isoformat(),
+        "created_at": uuid.uuid1().time,
         "chat_history": []
     }
-    
     return jsonify({"session_id": session_id})
 
 @app.route('/chat/history/<session_id>', methods=['GET'])
-def get_chat_history(session_id):
-    """Retrieve chat history for a session"""
+def get_history(session_id):
     if session_id not in chat_sessions:
-        return jsonify({"error": "Session not found"}), 404
-    
+        return jsonify({"error": "Invalid session ID"}), 404
     return jsonify(chat_sessions[session_id])
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    """Process user message and provide response"""
     data = request.json
-    
-    if not data or not 'query' in data or not 'session_id' in data:
-        return jsonify({"error": "Missing query or session_id parameter"}), 400
-    
+    if not data or 'query' not in data or 'session_id' not in data:
+        return jsonify({"error": "Missing parameters"}), 400
+
     session_id = data['session_id']
-    user_query = data['query']
-    
-    # Check if session exists
+    query = data['query']
+
     if session_id not in chat_sessions:
-        return jsonify({"error": "Invalid or expired session"}), 404
-    
-    # Process the user query
-    # For now, implementing some simple response logic
-    # In a real app, you would integrate with a more sophisticated AI system
-    response = generate_response(user_query)
-    
-    # Add message to chat history
+        return jsonify({"error": "Invalid session ID"}), 404
+
+    retrieved_chunks = retrieve_relevant_chunks(query)
+    context = "\n\n".join(retrieved_chunks)
+
+    response_text = generate_answer(context, query)
+
+    # Save to history
     chat_sessions[session_id]["chat_history"].append({
-        "timestamp": datetime.now().isoformat(),
-        "query": user_query,
-        "response": response
+        "query": query,
+        "response": response_text
     })
-    
+
     return jsonify({
-        "response": response,
+        "response": response_text,
         "session_id": session_id
     })
 
-def generate_response(query):
-    """Generate a chatbot response based on user query"""
-    # Lowercase the query for easier matching
-    query_lower = query.lower()
-    
-    # Basic response mapping - expanded for more scenarios
-    responses = {
-        "hello": "Hello! How can I help you with SBI Fraud Detection today?",
-        "hi": "Hi there! How can I assist you with fraud detection?",
-        "help": "I can help you understand SBI's fraud detection services, explain how to report suspicious activities, or provide general information about our security features.",
-        "fraud": "SBI's fraud detection system uses advanced AI to identify suspicious patterns and activities. We monitor transactions 24/7 to keep your accounts safe.",
-        "report": "To report suspicious activity, please use the 'Manual Data Entry' feature in the Detection menu or contact our 24/7 fraud reporting line at 1-800-SBI-FRAUD.",
-        "account": "To check if your account is secure, please log in to your SBI online banking and review the 'Security Center' section. You can also set up fraud alerts in your account settings.",
-        "suspicious": "If you've noticed suspicious transactions, please immediately call our fraud hotline at 1-800-SBI-FRAUD and freeze your account from the SBI mobile app.",
-        "phishing": "Beware of phishing attempts. SBI will never ask for your full password, OTP, or PIN via email or phone. Always use our official website or app for transactions.",
-        "otp": "Never share your OTP (One-Time Password) with anyone. SBI representatives will never ask for your OTP over phone or email.",
-        "secure": "SBI uses multi-layer security protocols, including biometric authentication, encryption, and AI-based fraud monitoring to keep your accounts secure.",
-        "contact": "You can reach our support team at support@sbifraud.com or call our hotline at 1-800-SBI-HELP.",
-        "thank": "You're welcome! Is there anything else I can help you with today?",
-        "bye": "Thank you for chatting with SBI Fraud Detection Assistant. Have a great day and stay secure!"
-    }
-    
-    # Check for keyword matches
-    for keyword, response in responses.items():
-        if keyword in query_lower:
-            return response
-    
-    # Default response if no keywords match
-    return "Thank you for your question. Our fraud detection system constantly monitors for suspicious activities on your account. Is there anything specific about fraud prevention or detection that you'd like to know more about?"
 
+# ===== Run the app =====
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
